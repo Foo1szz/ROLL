@@ -4,7 +4,17 @@ import numpy as np
 from ray.util.timer import _Timer
 from codetiming import Timer
 
-from roll.utils.functionals import masked_mean, reduce_metrics
+from roll.utils.functionals import agg_loss, compute_approx_kl, masked_mean, reduce_metrics
+
+
+def _to_bool_numpy(values) -> np.ndarray:
+    return np.asarray([bool(val) for val in values], dtype=bool)
+
+
+def _std_value(values: torch.Tensor) -> float:
+    if values.numel() <= 1:
+        return 0.0
+    return torch.std(values.float(), unbiased=False).item()
 
 
 class MetricsManager:
@@ -85,7 +95,7 @@ class MetricsManager:
             if hasattr(timer, "last"):
                 self.metrics[f"time/{name}"] = timer.last
 
-    def add_token_metrics(self, batch, prefix: str = "token") -> Dict[str, Any]:
+    def add_token_metrics(self, batch, prefix: str = "token", record: bool = True) -> Dict[str, Any]:
         response_mask = batch.batch["response_mask"][:, 1:].bool()
         prompt_mask = batch.batch["prompt_mask"].bool()
 
@@ -168,10 +178,17 @@ class MetricsManager:
             )
         except:
             pass
-        self.add_metrics(metrics)
+        if record:
+            self.add_metrics(metrics)
         return metrics
 
-    def add_values_metrics(self, batch, prefix: str = "critic") -> Dict[str, Any]:
+    def add_values_metrics(
+        self,
+        batch,
+        prefix: str = "critic",
+        record: bool = True,
+        entropy_value: Optional[float] = None,
+    ) -> Dict[str, Any]:
         metrics = {}
 
         sequence_score = batch.batch["scores"]
@@ -183,7 +200,9 @@ class MetricsManager:
         response_mask = batch.batch["final_response_mask"].clone().bool()
         raw_advantages = batch.batch["raw_advantages"]
         returns = batch.batch["returns"]
-        agg_entropy = batch.meta_info.get("agg_entropy", torch.tensor(0))
+        if entropy_value is None:
+            agg_entropy = batch.meta_info.get("agg_entropy", torch.tensor(0))
+            entropy_value = agg_entropy.item() if torch.is_tensor(agg_entropy) else float(agg_entropy)
 
         max_score = 1
         min_score = 0
@@ -191,7 +210,7 @@ class MetricsManager:
         correct_mask = sequence_score == max_score
         incorrect_mask = sequence_score == min_score
 
-        metrics[f"{prefix}/entropy/mean"] = agg_entropy.item()
+        metrics[f"{prefix}/entropy/mean"] = float(entropy_value)
         metrics[f"{prefix}/correct/mean"] = (sequence_score == max_score).detach().float().mean().item()
 
         metrics[f"{prefix}/score_distribution/max_value"] = max_score
@@ -296,10 +315,11 @@ class MetricsManager:
                 metrics[f"{prefix}/values/max"] = torch.max(values[response_mask]).detach().item()
                 metrics[f"{prefix}/values/min"] = torch.min(values[response_mask]).detach().item()
 
-        self.add_metrics(metrics)
+        if record:
+            self.add_metrics(metrics)
         return metrics
 
-    def add_group_metrics(self, batch, n_sample: int, prefix: str = "group") -> Dict[str, Any]:
+    def add_group_metrics(self, batch, n_sample: int, prefix: str = "group", record: bool = True) -> Dict[str, Any]:
         if n_sample <= 1:
             return {}
 
@@ -380,6 +400,221 @@ class MetricsManager:
                     correct_incorrect_adv_diff
                 ).item()
 
+        if record:
+            self.add_metrics(metrics)
+        return metrics
+
+    def add_mask_metrics(self, batch, prefix: str = "actor", record: bool = True) -> Dict[str, Any]:
+        response_mask = batch.batch["response_mask"][:, 1:].bool()
+        final_response_mask = batch.batch.get("final_response_mask", response_mask).bool()
+        valid_samples = torch.any(final_response_mask, dim=1).float()
+
+        metrics = {
+            f"{prefix}/samples_used": valid_samples.sum().item(),
+            f"{prefix}/samples_total": float(valid_samples.numel()),
+            f"{prefix}/final_mask_ratio": valid_samples.mean().item(),
+        }
+
+        if response_mask.sum() > 0:
+            metrics[f"{prefix}/token_keep_ratio"] = (
+                final_response_mask.float().sum() / (response_mask.float().sum() + 1e-8)
+            ).item()
+
+        if record:
+            self.add_metrics(metrics)
+        return metrics
+
+    def add_kl_metrics(
+        self,
+        batch,
+        prefix: str = "critic",
+        record: bool = True,
+        kl_penalty: str = "kl",
+    ) -> Dict[str, Any]:
+        if "old_log_probs" not in batch.batch or "ref_log_probs" not in batch.batch:
+            return {}
+
+        response_mask = batch.batch["response_mask"][:, 1:].bool()
+        if response_mask.sum() <= 0:
+            return {}
+
+        kld = compute_approx_kl(
+            log_probs=batch.batch["old_log_probs"],
+            log_probs_base=batch.batch["ref_log_probs"],
+            action_mask=response_mask,
+            kl_penalty=kl_penalty,
+        )
+        current_kl = masked_mean(kld, response_mask, dim=-1).mean().item()
+        metrics = {f"{prefix}/kl": current_kl}
+
+        if record:
+            self.add_metrics(metrics)
+        return metrics
+
+    def _compute_entropy_value(self, batch, entropy_tensor: Optional[torch.Tensor]) -> Optional[float]:
+        if entropy_tensor is None:
+            return None
+        response_mask = batch.batch["response_mask"][:, 1:]
+        if response_mask.sum() <= 0:
+            return 0.0
+        return agg_loss(loss_mat=entropy_tensor, loss_mask=response_mask, loss_agg_mode="token-mean").item()
+
+    def add_partition_all_metrics(
+        self,
+        batch,
+        n_sample: int = -1,
+        entropy_tensor: Optional[torch.Tensor] = None,
+    ) -> Dict[str, Any]:
+        if "is_noisy" not in batch.non_tensor_batch:
+            return {}
+
+        is_noisy = _to_bool_numpy(batch.non_tensor_batch["is_noisy"])
+        total_count = len(is_noisy)
+        metrics = {}
+        partitions = {"clean": ~is_noisy, "noisy": is_noisy}
+
+        for name, mask_np in partitions.items():
+            sample_count = int(mask_np.sum())
+            sample_ratio = float(sample_count / total_count) if total_count else 0.0
+            metrics[f"{name}/data/sample_count"] = sample_count
+            metrics[f"{name}/data/sample_ratio"] = sample_ratio
+            if sample_count == 0:
+                continue
+
+            sub_batch = batch.select_idxs(mask_np)
+            sub_metrics = {}
+            sub_metrics.update(self.add_mask_metrics(sub_batch, prefix="actor", record=False))
+            sub_metrics.update(self.add_kl_metrics(sub_batch, prefix="critic", record=False))
+            sub_metrics.update(self.add_token_metrics(sub_batch, prefix="token", record=False))
+            sub_metrics.update(
+                self.add_values_metrics(
+                    sub_batch,
+                    prefix="critic",
+                    record=False,
+                    entropy_value=self._compute_entropy_value(
+                        sub_batch,
+                        entropy_tensor[torch.as_tensor(mask_np, dtype=torch.bool, device=entropy_tensor.device)]
+                        if entropy_tensor is not None
+                        else None,
+                    ),
+                )
+            )
+            if n_sample > 1 and len(sub_batch) >= n_sample and len(sub_batch) % n_sample == 0:
+                sub_metrics.update(self.add_group_metrics(sub_batch, n_sample, prefix="group", record=False))
+            metrics.update({f"{name}/{key}": value for key, value in sub_metrics.items()})
+
+        self.add_metrics(metrics)
+        return metrics
+
+    def add_noisy_gold_target_metrics(
+        self,
+        batch,
+        n_sample: int = -1,
+        entropy_tensor: Optional[torch.Tensor] = None,
+    ) -> Dict[str, Any]:
+        if "is_noisy" not in batch.non_tensor_batch or "gold_scores" not in batch.batch:
+            return {}
+
+        noisy_mask_np = _to_bool_numpy(batch.non_tensor_batch["is_noisy"])
+        noisy_count = int(noisy_mask_np.sum())
+        if noisy_count == 0:
+            return {}
+
+        noisy_batch = batch.select_idxs(noisy_mask_np)
+        metrics = {}
+
+        target_correct = noisy_batch.batch["scores"].float() > 0.5
+        gold_correct = noisy_batch.batch["gold_scores"].float() > 0.5
+        response_rewards = noisy_batch.batch["response_level_rewards"].float()
+        response_mask = noisy_batch.batch["response_mask"][:, 1:].bool()
+        final_response_mask = noisy_batch.batch.get("final_response_mask", response_mask).bool()
+        response_length = response_mask.sum(-1).float()
+
+        metrics["noisy/target/correct_ratio"] = target_correct.float().mean().item()
+        metrics["noisy/gold/correct_ratio"] = gold_correct.float().mean().item()
+        metrics["noisy/diagnostics/target_gold_disagree_rate"] = (target_correct != gold_correct).float().mean().item()
+        metrics["noisy/diagnostics/gold_minus_target_correct_rate"] = (
+            gold_correct.float() - target_correct.float()
+        ).mean().item()
+        metrics["noisy/diagnostics/reward_flip_pos_rate"] = (
+            (response_rewards > 0) & (~gold_correct)
+        ).float().mean().item()
+        metrics["noisy/diagnostics/reward_flip_neg_rate"] = (
+            (response_rewards <= 0) & gold_correct
+        ).float().mean().item()
+        if gold_correct.any():
+            metrics["noisy/diagnostics/neg_reward_on_gold_correct_rate"] = (
+                (response_rewards[gold_correct] <= 0).float().mean().item()
+            )
+        if gold_correct.any():
+            metrics["noisy/diagnostics/gold_correct_reward_mean"] = response_rewards[gold_correct].mean().item()
+            metrics["noisy/diagnostics/gold_correct_length_mean"] = response_length[gold_correct].mean().item()
+        if (~gold_correct).any():
+            metrics["noisy/diagnostics/pos_reward_on_gold_wrong_rate"] = (
+                (response_rewards[~gold_correct] > 0).float().mean().item()
+            )
+            metrics["noisy/diagnostics/gold_wrong_reward_mean"] = response_rewards[~gold_correct].mean().item()
+            metrics["noisy/diagnostics/gold_wrong_length_mean"] = response_length[~gold_correct].mean().item()
+
+        if "advantages" in noisy_batch.batch:
+            sample_adv = masked_mean(noisy_batch.batch["advantages"], final_response_mask, dim=-1)
+            metrics["noisy/diagnostics/adv_on_gold_correct_mean"] = (
+                sample_adv[gold_correct].mean().item() if gold_correct.any() else 0.0
+            )
+            metrics["noisy/diagnostics/adv_on_gold_wrong_mean"] = (
+                sample_adv[~gold_correct].mean().item() if (~gold_correct).any() else 0.0
+            )
+            if gold_correct.any():
+                metrics["noisy/diagnostics/neg_adv_on_gold_correct_rate"] = (
+                    (sample_adv[gold_correct] < 0).float().mean().item()
+                )
+            if (~gold_correct).any():
+                metrics["noisy/diagnostics/pos_adv_on_gold_wrong_rate"] = (
+                    (sample_adv[~gold_correct] > 0).float().mean().item()
+                )
+
+        if entropy_tensor is not None:
+            noisy_entropy = entropy_tensor[torch.as_tensor(noisy_mask_np, dtype=torch.bool, device=entropy_tensor.device)]
+            sample_entropy = masked_mean(noisy_entropy, response_mask, dim=-1)
+            if gold_correct.any():
+                metrics["noisy/diagnostics/gold_correct_entropy_mean"] = sample_entropy[gold_correct].mean().item()
+            if (~gold_correct).any():
+                metrics["noisy/diagnostics/gold_wrong_entropy_mean"] = sample_entropy[~gold_correct].mean().item()
+
+        if n_sample > 1 and len(noisy_batch) >= n_sample and len(noisy_batch) % n_sample == 0:
+            num_groups = len(noisy_batch) // n_sample
+            grouped_target = target_correct.reshape(num_groups, n_sample)
+            grouped_gold = gold_correct.reshape(num_groups, n_sample)
+            target_count = grouped_target.sum(dim=1).float()
+            gold_count = grouped_gold.sum(dim=1).float()
+            gold_gap = gold_count - target_count
+
+            metrics["noisy/group/target_count/mean"] = target_count.mean().item()
+            metrics["noisy/group/target_count/std"] = _std_value(target_count)
+            metrics["noisy/group/target_count/max"] = target_count.max().item()
+            metrics["noisy/group/target_count/min"] = target_count.min().item()
+            metrics["noisy/group/target_pass_rate"] = (target_count > 0).float().mean().item()
+            metrics["noisy/group/target_correct_ratio/mean"] = (target_count / n_sample).mean().item()
+            metrics["noisy/group/target_correct_ratio/std"] = _std_value(target_count / n_sample)
+
+            metrics["noisy/group/gold_count/mean"] = gold_count.mean().item()
+            metrics["noisy/group/gold_count/std"] = _std_value(gold_count)
+            metrics["noisy/group/gold_count/max"] = gold_count.max().item()
+            metrics["noisy/group/gold_count/min"] = gold_count.min().item()
+            metrics["noisy/group/gold_pass_rate"] = (gold_count > 0).float().mean().item()
+            metrics["noisy/group/gold_correct_ratio/mean"] = (gold_count / n_sample).mean().item()
+            metrics["noisy/group/gold_correct_ratio/std"] = _std_value(gold_count / n_sample)
+            metrics["noisy/group/gold_target_gap/mean"] = gold_gap.mean().item()
+            metrics["noisy/group/gold_target_gap/std"] = _std_value(gold_gap)
+            metrics["noisy/group/gold_target_gap/max"] = gold_gap.max().item()
+            metrics["noisy/group/gold_target_gap/min"] = gold_gap.min().item()
+
+            gold_all_correct = grouped_gold.all(dim=1).float().mean().item()
+            gold_all_incorrect = (~grouped_gold).all(dim=1).float().mean().item()
+            metrics["noisy/group/gold_all_correct_groups_ratio"] = gold_all_correct
+            metrics["noisy/group/gold_all_incorrect_groups_ratio"] = gold_all_incorrect
+            metrics["noisy/group/gold_mixed_groups_ratio"] = 1.0 - gold_all_correct - gold_all_incorrect
+
         self.add_metrics(metrics)
         return metrics
 
@@ -395,6 +630,8 @@ class MetricsManager:
             actor_infer=actor_infer,
             actor_train=actor_train,
         )
+        self.add_mask_metrics(batch)
+        self.add_kl_metrics(batch)
         # 添加token相关的指标
         self.add_token_metrics(batch)
         # 添加values相关的指标

@@ -92,7 +92,7 @@ def _extract_after_last_end_think(response: str, prompt: str, start_think: str='
             # 3. 如果连 '\n\n' 都没找到，则返回空字符串
             return ""
 
-def _hf_verify_math_sample(response, answer, result, prompt):
+def _hf_verify_math_sample_multi(response, answers, result, prompt):
     try:
         # 在解析之前，先对模型的原始输出进行预处理
         cleaned_response = _extract_after_last_end_think(response, prompt)
@@ -132,27 +132,28 @@ def _hf_verify_math_sample(response, answer, result, prompt):
             # 通常我们只关心第一个解析出的结果
             exect_answer = parsed_answers[0]
 
-        gold_answer = parse(answer)
-
-        if gold_answer is None or exect_answer is None:
-            result.append((False, "", ""))
-        else:
-            # 假设 verify 函数可以处理 parse 返回的对象
-            ans = verify(gold_answer[0], exect_answer)
-            result.append((ans, str(gold_answer[0]), str(exect_answer)))
+        verify_results = []
+        for answer in answers:
+            parsed_target = parse(answer)
+            if parsed_target is None or exect_answer is None:
+                verify_results.append((False, "", ""))
+            else:
+                ans = verify(parsed_target[0], exect_answer)
+                verify_results.append((ans, str(parsed_target[0]), str(exect_answer)))
+        result.append(verify_results)
             
     except Exception as e:
         # 捕获任何潜在的异常，确保进程不会崩溃
-        result.append((False, "", ""))
+        result.append([(False, "", "") for _ in answers])
 
 
-def hf_verify_math_sample(answer_a, answer_b, prompt, timeout_sec=5.0):
+def hf_verify_math_sample_multi(response, answers, prompt, timeout_sec=5.0):
     with multiprocessing.Manager() as manager:
         result = manager.list()
         
         p = multiprocessing.Process(
-            target=_hf_verify_math_sample,
-            args=(answer_a, answer_b, result, prompt)
+            target=_hf_verify_math_sample_multi,
+            args=(response, answers, result, prompt)
         )
         
         p.start()
@@ -169,8 +170,12 @@ def hf_verify_math_sample(answer_a, answer_b, prompt, timeout_sec=5.0):
                     p.kill()
             p.join(timeout=2)
         if not result:
-            return False, "", ""
+            return [(False, "", "") for _ in answers]
         return result[0]
+
+
+def hf_verify_math_sample(response, answer, prompt, timeout_sec=5.0):
+    return hf_verify_math_sample_multi(response=response, answers=[answer], prompt=prompt, timeout_sec=timeout_sec)[0]
 
 def get_repetition_penalty_reward(ngram_size: int, max_penalty: float):
     if max_penalty > 0:
@@ -226,6 +231,7 @@ class MathRuleRewardWorker(Worker):
     @register(dispatch_mode=Dispatch.DP_MP_COMPUTE, clear_cache=False)
     def compute_rewards(self, data: DataProto):
         verify_answer = []
+        gold_verify_answer = []
         repetition_penalty_rewards = []
         long_block_penalty_rewards = []
         response_length_rewards = []
@@ -233,7 +239,13 @@ class MathRuleRewardWorker(Worker):
         
         response_text_list = self.tokenizer.batch_decode(data.batch["responses"], skip_special_tokens=False)
         prompt_text_list = self.tokenizer.batch_decode(data.batch["prompts"], skip_special_tokens=False)
-        for response, answer, prompt in zip(response_text_list, data.non_tensor_batch["ground_truth"], prompt_text_list):
+        gold_answer_list = data.non_tensor_batch.get("gold_answer", data.non_tensor_batch["ground_truth"])
+        for response, answer, gold_answer, prompt in zip(
+            response_text_list,
+            data.non_tensor_batch["ground_truth"],
+            gold_answer_list,
+            prompt_text_list,
+        ):
             
             prompt = prompt.replace("<|endoftext|>", "").replace("<pad>", "")
             response = response.replace("<|endoftext|>", "").replace("<pad>", "")
@@ -242,22 +254,33 @@ class MathRuleRewardWorker(Worker):
             
             try:
                 with timeout(5):
-                    correct, extracted_ground_truth, extracted_response = hf_verify_math_sample(
-                        response, f"${answer}$", prompt
-                    )
+                    verify_inputs = [f"${answer}$"]
+                    gold_answer = answer if gold_answer is None else str(gold_answer)
+                    if gold_answer != answer:
+                        verify_inputs.append(f"${gold_answer}$")
+                    verify_results = hf_verify_math_sample_multi(response, verify_inputs, prompt)
+
+                correct, extracted_ground_truth, extracted_response = verify_results[0]
+                if gold_answer == answer:
+                    gold_correct = correct
+                else:
+                    gold_correct = verify_results[1][0]
             
                 log_data = {
                     "response": response,
                     "extracted_response": extracted_response,
                     "answer": answer,
+                    "gold_answer": gold_answer,
                     "extracted_ground_truth": extracted_ground_truth,
                     "correct": correct,
+                    "gold_correct": gold_correct,
                 }
                 # self.logger.info(json.dumps(log_data, ensure_ascii=False))
 
             except Exception as e:
                 self.logger.error(f"timeout or error during hf_verify_math_sample. answer: {answer}, response: {response}")
                 correct = False
+                gold_correct = False
                 extracted_response = ""
                 extracted_ground_truth = ""
             
@@ -265,6 +288,10 @@ class MathRuleRewardWorker(Worker):
                 verify_answer.append(1)
             else:
                 verify_answer.append(0)
+            if gold_correct:
+                gold_verify_answer.append(1)
+            else:
+                gold_verify_answer.append(0)
             repetition_penalty_rewards.append(self.repetition_penalty_reward_fn(response))
             format_rewards.append(format_reward_fn(response, self.format_pattern))
             long_block_penalty_rewards.append(long_block_penalty_reward_fn(response))
@@ -276,6 +303,7 @@ class MathRuleRewardWorker(Worker):
         long_block_penalty_rewards = torch.tensor(long_block_penalty_rewards, dtype=torch.float16)
         format_rewards = torch.tensor(format_rewards, dtype=torch.float16)
         scores = torch.tensor(verify_answer, dtype=torch.float16)
+        gold_scores = torch.tensor(gold_verify_answer, dtype=torch.float16)
         response_level_rewards = torch.tensor(verify_answer, dtype=torch.float16)
 
         output = DataProto.from_dict(
@@ -283,6 +311,7 @@ class MathRuleRewardWorker(Worker):
                 "token_level_rewards": token_level_rewards,
                 "response_level_rewards": response_level_rewards,
                 "scores": scores,
+                "gold_scores": gold_scores,
             }
         )
 

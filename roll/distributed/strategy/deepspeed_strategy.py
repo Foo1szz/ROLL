@@ -507,15 +507,84 @@ class DeepSpeedTrainStrategy(DeepSpeedInferStrategy, TrainStrategy):
         }
         return metrics
 
+    def _count_zero2_param_alias_mismatches(self):
+        optimizer = getattr(self.model, "optimizer", None)
+        required_attrs = (
+            "bit16_groups",
+            "bit16_groups_flat",
+            "round_robin_bit16_groups",
+            "round_robin_bit16_meta",
+            "round_robin_bit16_indices",
+            "unflatten",
+        )
+        if self.ds_config.is_zero3() or optimizer is None or any(not hasattr(optimizer, attr) for attr in required_attrs):
+            return None
+
+        mismatch_count = 0
+        for group_index in range(len(optimizer.bit16_groups)):
+            updated_params = optimizer.unflatten(
+                optimizer.bit16_groups_flat[group_index], optimizer.round_robin_bit16_meta[group_index]
+            )
+            for param, expected in zip(optimizer.round_robin_bit16_groups[group_index], updated_params):
+                if param.data.data_ptr() != expected.data.data_ptr():
+                    mismatch_count += 1
+
+            for param_index, param in enumerate(optimizer.bit16_groups[group_index]):
+                expected_index = optimizer.round_robin_bit16_indices[group_index][param_index]
+                expected = optimizer.round_robin_bit16_groups[group_index][expected_index]
+                if param.data.data_ptr() != expected.data.data_ptr():
+                    mismatch_count += 1
+
+        return mismatch_count
+
+    def _repair_zero2_param_aliases_after_checkpoint_load(self):
+        optimizer = getattr(self.model, "optimizer", None)
+        mismatch_count = self._count_zero2_param_alias_mismatches()
+        if mismatch_count is None:
+            return
+        if mismatch_count == 0:
+            logger.info("ZeRO stage1/2 param alias check passed after checkpoint load")
+            return
+
+        logger.warning(
+            "Detected %s ZeRO stage1/2 param alias mismatches after checkpoint load; "
+            "rebinding model params to flat buffers to avoid duplicate GPU weights.",
+            mismatch_count,
+        )
+        for group_index in range(len(optimizer.bit16_groups)):
+            optimizer._update_model_bit16_weights(group_index)
+
+        for group in optimizer.bit16_groups:
+            for param in group:
+                if hasattr(param, "_hp_mapping"):
+                    param._hp_mapping = None
+        if hasattr(optimizer, "_link_all_hp_params"):
+            optimizer._link_all_hp_params()
+
+        current_platform.empty_cache()
+        mismatch_count_after = self._count_zero2_param_alias_mismatches()
+        logger.info("ZeRO stage1/2 param alias mismatches after repair: %s", mismatch_count_after)
+
+    def _reset_deepspeed_offload_bookkeeping_after_checkpoint_load(self):
+        if hasattr(self.model, "offloaded_states"):
+            self.model.offloaded_states = set()
+        optimizer = getattr(self.model, "optimizer", None)
+        if optimizer is not None and hasattr(optimizer, "offloaded_states"):
+            optimizer.offloaded_states = set()
+        logger.info("Reset DeepSpeed offload bookkeeping after checkpoint load")
+
     def load_checkpoint(self, load_dir, tag="checkpoint", **kwargs):
         logger.info(f"load checkpoint from {load_dir}")
         self.model.load_checkpoint(load_dir, tag=tag, **kwargs)
+        self._reset_deepspeed_offload_bookkeeping_after_checkpoint_load()
+        self._repair_zero2_param_aliases_after_checkpoint_load()
+        self.offload_states()
 
     def collect_lora_params(self):
         peft_model = self.unwrap_model()
         if not self.ds_config.is_zero3():
             lora_state_dict = get_peft_model_state_dict(peft_model)
-            return lora_state_dict
+            return list(lora_state_dict.items())
 
         adapter_name = "default"
         state_dict = peft_model.state_dict()

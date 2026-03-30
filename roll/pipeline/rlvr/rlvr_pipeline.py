@@ -570,6 +570,7 @@ class RLVRPipeline(BasePipeline):
                 metrics_mgr.add_metric("time/ref_log_probs_values", cal_ref_log_probs_timer.last)
 
                 with Timer(name="cal_old_log_probs_values", logger=None) as cal_old_logpb_timer:
+                    old_log_probs_entropy = None
                     if self.is_lora:
                         batch.meta_info["disable_adapter"] = False
                     batch.meta_info["is_offload_states"] = False
@@ -603,6 +604,7 @@ class RLVRPipeline(BasePipeline):
                             loss_mask=batch.batch["response_mask"][:, 1:],
                             loss_agg_mode="token-mean",
                         )
+                        old_log_probs_entropy = old_log_probs.batch["entropy"]
                         batch.meta_info["agg_entropy"] = agg_entropy
 
                         batch.batch["old_log_probs"] = old_log_probs.batch["log_probs"]
@@ -694,6 +696,17 @@ class RLVRPipeline(BasePipeline):
                     resource_manager=self.resource_manager,
                     actor_infer=self.actor_infer,
                     actor_train=self.actor_train,
+                )
+                n_sample = batch.meta_info.get("generation_config", {}).get("num_return_sequences", 1)
+                metrics_mgr.add_partition_all_metrics(
+                    batch,
+                    n_sample=n_sample,
+                    entropy_tensor=old_log_probs_entropy,
+                )
+                metrics_mgr.add_noisy_gold_target_metrics(
+                    batch,
+                    n_sample=n_sample,
+                    entropy_tensor=old_log_probs_entropy,
                 )
                 batch_grouped: Dict[str, DataProto] = batch.group_by("domain")
                 metrics_mgr.add_domain_all_metrics(global_step, batch_grouped)
