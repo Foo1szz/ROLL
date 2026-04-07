@@ -38,11 +38,49 @@ from roll.utils.functionals import (
 )
 from roll.utils.kl_controller import get_kl_controller
 from roll.utils.logging import get_logger
-from roll.utils.metrics.metrics_manager import MetricsManager
+from roll.utils.metrics.metrics_manager import MetricsManager, build_prompt_encounter_metrics
 from roll.utils.dynamic_batching import dynamic_batching_shard
 
 
 logger = get_logger()
+
+
+SELECTED_LOG_METRICS = {
+    "clean/entropy_mean",
+    "clean/target_correct_entropy_mean",
+    "clean/target_wrong_entropy_mean",
+    "clean/answer_entropy_mean",
+    "clean/target_correct_answer_entropy_mean",
+    "clean/target_wrong_answer_entropy_mean",
+    "noisy/entropy_mean",
+    "noisy/gold_correct_entropy_mean",
+    "noisy/target_correct_entropy_mean",
+    "noisy/target_wrong_entropy_mean",
+    "noisy/target_gold_both_wrong_entropy_mean",
+    "noisy/pseudo_target_mismatch_entropy_mean",
+    "noisy/answer_entropy_mean",
+    "noisy/gold_correct_answer_entropy_mean",
+    "noisy/target_correct_answer_entropy_mean",
+    "noisy/target_wrong_answer_entropy_mean",
+    "noisy/target_gold_both_wrong_answer_entropy_mean",
+    "noisy/pseudo_target_mismatch_answer_entropy_mean",
+    "clean/target_correct_ratio",
+    "noisy/target_correct_ratio",
+    "noisy/gold_correct_ratio",
+    "noisy/gold_pass_rate",
+    "noisy/gold_count_mean_on_gold_pass",
+    "noisy/gold_pass_target_pass_rate",
+    "noisy/target_count_mean_on_gold_pass",
+    "noisy/gold_pass_target_zero_rate",
+    "noisy/gold_strict_majority_rate",
+    "noisy/gold_tied_top_rate",
+    "clean/advantages_mean",
+    "clean/target_correct_advantages_mean",
+    "clean/target_wrong_advantages_mean",
+    "noisy/advantages_mean",
+    "noisy/target_correct_advantages_mean",
+    "noisy/target_wrong_advantages_mean",
+}
 
 
 def is_lora_training(pipeline_config: RLVRConfig) -> bool:
@@ -341,6 +379,10 @@ class RLVRPipeline(BasePipeline):
         for domain in self.rewards.keys():
             self.running[domain] = RunningMoments()
 
+    @staticmethod
+    def _filter_logged_metrics(metrics: Dict[str, Any]) -> Dict[str, Any]:
+        return {key: value for key, value in metrics.items() if key in SELECTED_LOG_METRICS}
+
     @torch.no_grad()
     def save_metrics(self, batch):
         def remove_leading_zeros(A, r_mask):
@@ -412,6 +454,30 @@ class RLVRPipeline(BasePipeline):
                     f.write(json.dumps(r, ensure_ascii=False) + "\n")
         except Exception as e:
             logger.info(f"Writing files catch error :{e}")
+
+    @torch.no_grad()
+    def save_prompt_metrics(self, batch, entropy_tensor, n_sample: int) -> None:
+        records = build_prompt_encounter_metrics(
+            batch=batch,
+            entropy_tensor=entropy_tensor,
+            tokenizer=self.tokenizer,
+            n_sample=n_sample,
+        )
+        if not records:
+            return
+
+        relative_run_dir = os.path.relpath(self.pipeline_config.output_dir, self.pipeline_config.logging_dir)
+        relative_parent_dir = os.path.dirname(relative_run_dir)
+        run_name = os.path.basename(relative_run_dir)
+        file_dir = os.path.join(self.pipeline_config.logging_dir, "prompt_metrics", relative_parent_dir)
+        os.makedirs(file_dir, exist_ok=True)
+        file_path = os.path.join(file_dir, f"{run_name}.jsonl")
+        try:
+            with open(file_path, "a", encoding="utf-8") as f:
+                for record in records:
+                    f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except Exception as e:
+            logger.info(f"Writing prompt metrics catch error: {e}")
 
     def get_generation_config(self, generating_args: Optional[GeneratingArguments] = None):
         generating_args = (
@@ -675,7 +741,7 @@ class RLVRPipeline(BasePipeline):
                 if batch.batch["final_response_mask"].sum() == 0:
                     logger.info("Warning: final_response_mask.sum() == 0! Current step will be skipped.")
                     metrics_mgr.add_metric("mask/final_mask_sum_eq_0", 1)
-                    metrics = metrics_mgr.get_metrics()
+                    metrics = self._filter_logged_metrics(metrics_mgr.get_metrics())
                     # do ckpt
                     self.state.step = global_step
                     self.state.log_history.append(metrics)
@@ -688,28 +754,16 @@ class RLVRPipeline(BasePipeline):
                     metrics_mgr.add_metric("mask/final_mask_sum_eq_0", 0)
 
                 batch.reorder(indices=torch.argsort(batch.batch["prompt_id"]))
-                batch.pop("prompt_id")
 
-                metrics_mgr.add_all_metrics(
-                    global_step,
-                    batch,
-                    resource_manager=self.resource_manager,
-                    actor_infer=self.actor_infer,
-                    actor_train=self.actor_train,
-                )
                 n_sample = batch.meta_info.get("generation_config", {}).get("num_return_sequences", 1)
-                metrics_mgr.add_partition_all_metrics(
+                self.save_prompt_metrics(batch, entropy_tensor=old_log_probs_entropy, n_sample=n_sample)
+                batch.pop("prompt_id")
+                metrics_mgr.add_selected_clean_noisy_metrics(
                     batch,
-                    n_sample=n_sample,
                     entropy_tensor=old_log_probs_entropy,
-                )
-                metrics_mgr.add_noisy_gold_target_metrics(
-                    batch,
+                    tokenizer=self.tokenizer,
                     n_sample=n_sample,
-                    entropy_tensor=old_log_probs_entropy,
                 )
-                batch_grouped: Dict[str, DataProto] = batch.group_by("domain")
-                metrics_mgr.add_domain_all_metrics(global_step, batch_grouped)
 
                 with Timer(name="step_train", logger=None) as step_train_timer:
                     if self.pipeline_config.adv_estimator == "gae":
@@ -760,7 +814,7 @@ class RLVRPipeline(BasePipeline):
                         metrics_mgr.add_metrics(val_metrics)
                     metrics_mgr.add_metric("time/val_step", val_step_timer.last)
 
-                metrics = metrics_mgr.get_metrics()
+                metrics = self._filter_logged_metrics(metrics_mgr.get_metrics())
                 # do ckpt
                 self.state.step = global_step
                 self.state.log_history.append(metrics)

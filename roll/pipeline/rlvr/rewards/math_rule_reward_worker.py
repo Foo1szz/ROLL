@@ -92,7 +92,72 @@ def _extract_after_last_end_think(response: str, prompt: str, start_think: str='
             # 3. 如果连 '\n\n' 都没找到，则返回空字符串
             return ""
 
-def _hf_verify_math_sample_multi(response, answers, result, prompt):
+def _last_boxed_only_string(string: str) -> Optional[str]:
+    idx = string.rfind("\\boxed")
+    prefix = "\\boxed"
+    if idx < 0:
+        idx = string.rfind("\\fbox")
+        prefix = "\\fbox"
+        if idx < 0:
+            return None
+
+    i = idx
+    right_brace_idx = None
+    num_left_braces_open = 0
+    while i < len(string):
+        if string[i] == "{":
+            num_left_braces_open += 1
+        elif string[i] == "}":
+            num_left_braces_open -= 1
+            if num_left_braces_open == 0:
+                right_brace_idx = i
+                break
+        i += 1
+
+    if right_brace_idx is None:
+        return None
+    return string[idx:right_brace_idx + 1]
+
+
+def _remove_boxed(boxed_string: Optional[str]) -> Optional[str]:
+    if boxed_string is None:
+        return None
+
+    for left in ("\\boxed{", "\\fbox{"):
+        if boxed_string.startswith(left) and boxed_string.endswith("}"):
+            return boxed_string[len(left):-1]
+    return None
+
+
+def _extract_verl_boxed_answer(cleaned_response: str, raw_response: Optional[str] = None) -> Optional[str]:
+    candidate_response = cleaned_response.strip() if cleaned_response else ""
+    if not candidate_response and raw_response is not None:
+        candidate_response = raw_response.strip()
+    if not candidate_response:
+        return None
+    last_line = candidate_response.splitlines()[-1].strip()
+    if not last_line:
+        return None
+    return _last_boxed_only_string(last_line)
+
+
+def _extract_predicted_answer(cleaned_response: str, reward_type: Optional[str], raw_response: Optional[str] = None):
+    if reward_type == "verl_boxed":
+        extracted_answer = _extract_verl_boxed_answer(cleaned_response, raw_response=raw_response)
+        if extracted_answer is None:
+            return None, ""
+        parsed_answers = parse(extracted_answer, fallback_mode="no_fallback")
+        if not parsed_answers:
+            return None, extracted_answer
+        return parsed_answers[0], extracted_answer
+
+    parsed_answers = parse(cleaned_response, fallback_mode="no_fallback")
+    if not parsed_answers:
+        return None, ""
+    return parsed_answers[0], str(parsed_answers[0])
+
+
+def _hf_verify_math_sample_multi(response, answers, result, prompt, reward_type=None):
     try:
         # 在解析之前，先对模型的原始输出进行预处理
         cleaned_response = _extract_after_last_end_think(response, prompt)
@@ -123,14 +188,11 @@ def _hf_verify_math_sample_multi(response, answers, result, prompt):
            => 默认值: False (不抛出异常，返回空列表)
            => 建议：保持默认值，确保程序的健壮性，不会因单个样本出错而中断。
         """
-        parsed_answers = parse(cleaned_response, fallback_mode="no_fallback")
-        
-        # 如果解析结果为空，则认为提取失败
-        if not parsed_answers:
-            exect_answer = None
-        else:
-            # 通常我们只关心第一个解析出的结果
-            exect_answer = parsed_answers[0]
+        exect_answer, extracted_response = _extract_predicted_answer(
+            cleaned_response,
+            reward_type,
+            raw_response=response,
+        )
 
         verify_results = []
         for answer in answers:
@@ -139,7 +201,7 @@ def _hf_verify_math_sample_multi(response, answers, result, prompt):
                 verify_results.append((False, "", ""))
             else:
                 ans = verify(parsed_target[0], exect_answer)
-                verify_results.append((ans, str(parsed_target[0]), str(exect_answer)))
+                verify_results.append((ans, str(parsed_target[0]), str(extracted_response)))
         result.append(verify_results)
             
     except Exception as e:
@@ -147,13 +209,13 @@ def _hf_verify_math_sample_multi(response, answers, result, prompt):
         result.append([(False, "", "") for _ in answers])
 
 
-def hf_verify_math_sample_multi(response, answers, prompt, timeout_sec=5.0):
+def hf_verify_math_sample_multi(response, answers, prompt, timeout_sec=5.0, reward_type=None):
     with multiprocessing.Manager() as manager:
         result = manager.list()
         
         p = multiprocessing.Process(
             target=_hf_verify_math_sample_multi,
-            args=(response, answers, result, prompt)
+            args=(response, answers, result, prompt, reward_type)
         )
         
         p.start()
@@ -174,8 +236,14 @@ def hf_verify_math_sample_multi(response, answers, prompt, timeout_sec=5.0):
         return result[0]
 
 
-def hf_verify_math_sample(response, answer, prompt, timeout_sec=5.0):
-    return hf_verify_math_sample_multi(response=response, answers=[answer], prompt=prompt, timeout_sec=timeout_sec)[0]
+def hf_verify_math_sample(response, answer, prompt, timeout_sec=5.0, reward_type=None):
+    return hf_verify_math_sample_multi(
+        response=response,
+        answers=[answer],
+        prompt=prompt,
+        timeout_sec=timeout_sec,
+        reward_type=reward_type,
+    )[0]
 
 def get_repetition_penalty_reward(ngram_size: int, max_penalty: float):
     if max_penalty > 0:
@@ -223,6 +291,7 @@ class MathRuleRewardWorker(Worker):
         self.strategy: Optional[Union[InferenceStrategy, TrainStrategy]] = None
         self.repetition_penalty_reward_fn = get_repetition_penalty_reward(ngram_size=3, max_penalty=-0.1)
         self.format_pattern = getattr(self.worker_config, "format_pattern", None)
+        self.reward_type = getattr(self.worker_config, "reward_type", None)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def initialize(self, pipeline_config):
@@ -258,7 +327,12 @@ class MathRuleRewardWorker(Worker):
                     gold_answer = answer if gold_answer is None else str(gold_answer)
                     if gold_answer != answer:
                         verify_inputs.append(f"${gold_answer}$")
-                    verify_results = hf_verify_math_sample_multi(response, verify_inputs, prompt)
+                    verify_results = hf_verify_math_sample_multi(
+                        response,
+                        verify_inputs,
+                        prompt,
+                        reward_type=self.reward_type,
+                    )
 
                 correct, extracted_ground_truth, extracted_response = verify_results[0]
                 if gold_answer == answer:

@@ -1,4 +1,8 @@
-from typing import Dict, Any, List, Optional
+import hashlib
+import re
+from typing import Dict, Any, List, Optional, Tuple
+
+from math_verify import parse, verify
 import torch
 import numpy as np
 from ray.util.timer import _Timer
@@ -15,6 +19,250 @@ def _std_value(values: torch.Tensor) -> float:
     if values.numel() <= 1:
         return 0.0
     return torch.std(values.float(), unbiased=False).item()
+
+
+_ANSWER_PATTERNS = [
+    re.compile(r"<answer>\s*(.*?)\s*</answer>", re.DOTALL),
+    re.compile(r"####\s*(.*)"),
+]
+
+
+def _clean_text(text: Any) -> str:
+    return str(text or "").replace("<|endoftext|>", "").replace("<pad>", "").strip()
+
+
+def _strip_math_wrappers(text: str) -> str:
+    value = _clean_text(text)
+    while True:
+        updated = value
+        if updated.startswith("\\[") and updated.endswith("\\]"):
+            updated = updated[2:-2].strip()
+        if updated.startswith("\\(") and updated.endswith("\\)"):
+            updated = updated[2:-2].strip()
+        if updated.startswith("$") and updated.endswith("$"):
+            updated = updated[1:-1].strip()
+        if updated == value:
+            return updated
+        value = updated
+
+
+def _last_boxed_only_string(text: str) -> Optional[str]:
+    idx = text.rfind("\\boxed")
+    if idx < 0:
+        idx = text.rfind("\\fbox")
+        if idx < 0:
+            return None
+
+    brace_balance = 0
+    right_brace_idx = None
+    for i in range(idx, len(text)):
+        if text[i] == "{":
+            brace_balance += 1
+        elif text[i] == "}":
+            brace_balance -= 1
+            if brace_balance == 0:
+                right_brace_idx = i
+                break
+
+    if right_brace_idx is None:
+        return None
+    return text[idx:right_brace_idx + 1]
+
+
+def _extract_boxed_string(text: Any) -> str:
+    content = _clean_text(text)
+    if not content:
+        return ""
+
+    last_line = _clean_text(content.splitlines()[-1])
+    extracted = _last_boxed_only_string(last_line)
+    if extracted:
+        return _clean_text(extracted)
+
+    extracted = _last_boxed_only_string(content)
+    return _clean_text(extracted) if extracted else ""
+
+
+def _extract_prediction_answer(text: Any) -> str:
+    return _extract_boxed_string(text)
+
+
+def _extract_answer(text: Any) -> str:
+    content = _clean_text(text)
+    boxed = _extract_boxed_string(content)
+    if boxed:
+        return boxed
+
+    for pattern in _ANSWER_PATTERNS:
+        match = pattern.search(content)
+        if match:
+            return _strip_math_wrappers(match.group(1))
+
+    literal_candidate = _strip_math_wrappers(content)
+    if (
+        literal_candidate
+        and "\n" not in content
+        and len(literal_candidate) <= 128
+    ):
+        try:
+            if parse(literal_candidate, fallback_mode="first_match"):
+                return literal_candidate
+        except Exception:
+            pass
+
+    numbers = re.findall(r"[-+]?\d+(?:\.\d+)?", content)
+    if numbers:
+        return numbers[-1]
+    return _strip_math_wrappers(content)
+
+
+def _parse_for_equivalence(text: Any):
+    answer_text = _extract_answer(text)
+    if not answer_text:
+        return None, ""
+
+    parse_inputs = []
+    if "\\boxed" in answer_text or "\\fbox" in answer_text:
+        parse_inputs.append((answer_text, {"fallback_mode": "no_fallback"}))
+    else:
+        parse_inputs.append((f"${answer_text}$", {}))
+        parse_inputs.append((answer_text, {"fallback_mode": "first_match"}))
+
+    for parse_input, parse_kwargs in parse_inputs:
+        try:
+            parsed_items = parse(parse_input, **parse_kwargs)
+        except Exception:
+            continue
+        if parsed_items:
+            return parsed_items[0], answer_text
+
+    return None, answer_text
+
+
+def _answers_equivalent(lhs: Any, rhs: Any) -> bool:
+    lhs_item, lhs_text = _parse_for_equivalence(lhs)
+    rhs_item, rhs_text = _parse_for_equivalence(rhs)
+    if not lhs_text or not rhs_text:
+        return False
+    if lhs_text == rhs_text:
+        return True
+    if lhs_item is None or rhs_item is None:
+        return False
+
+    try:
+        return bool(verify(rhs_item, lhs_item))
+    except Exception:
+        return False
+
+
+def _majority_equivalent_answer(answers: List[str]) -> Tuple[Optional[str], int]:
+    clusters = _equivalent_answer_clusters(answers)
+    if not clusters:
+        return None, 0
+
+    clusters.sort(key=lambda item: item["count"], reverse=True)
+    if len(clusters) > 1 and clusters[0]["count"] == clusters[1]["count"]:
+        return None, 0
+    return clusters[0]["representative"], int(clusters[0]["count"])
+
+
+def _equivalent_answer_clusters(
+    answers: List[str],
+    answer_indices: Optional[List[int]] = None,
+) -> List[dict[str, Any]]:
+    clusters: List[dict[str, Any]] = []
+    for position, answer in enumerate(answers):
+        if not answer:
+            continue
+
+        sample_index = answer_indices[position] if answer_indices is not None else position
+        for cluster in clusters:
+            if _answers_equivalent(answer, cluster["representative"]):
+                cluster["count"] += 1
+                cluster["indices"].append(sample_index)
+                break
+        else:
+            clusters.append({"representative": answer, "count": 1, "indices": [sample_index]})
+    return clusters
+
+
+def _answer_entropy_from_clusters(clusters: List[dict[str, Any]]) -> Optional[float]:
+    if not clusters:
+        return None
+    counts = np.asarray([cluster["count"] for cluster in clusters], dtype=np.float64)
+    total = counts.sum()
+    if total <= 0:
+        return None
+    probs = counts / total
+    return float(-(probs * np.log(probs)).sum())
+
+
+def build_prompt_encounter_metrics(
+    batch,
+    entropy_tensor: Optional[torch.Tensor],
+    tokenizer,
+    n_sample: int,
+) -> List[Dict[str, Any]]:
+    if tokenizer is None or len(batch) == 0:
+        return []
+
+    group_size = max(int(n_sample or 1), 1)
+    response_mask = batch.batch["response_mask"][:, 1:].bool()
+    entropy_valid_mask = response_mask.any(dim=-1)
+    sample_entropy = None
+    if entropy_tensor is not None:
+        sample_entropy = masked_mean(entropy_tensor, response_mask, dim=-1).float()
+
+    target_correct = batch.batch["scores"].float() > 0.5
+    prompts = tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=False)
+    responses = tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=False)
+    target_answers = batch.non_tensor_batch.get("ground_truth")
+    domains = batch.non_tensor_batch.get("domain")
+    is_noisy_values = batch.non_tensor_batch.get("is_noisy")
+    step = batch.meta_info.get("global_step")
+
+    records: List[Dict[str, Any]] = []
+    for start in range(0, len(batch), group_size):
+        end = min(start + group_size, len(batch))
+        if start >= end:
+            continue
+
+        group_entropies = None
+        if sample_entropy is not None:
+            valid_mask = entropy_valid_mask[start:end]
+            if torch.any(valid_mask):
+                group_entropies = sample_entropy[start:end][valid_mask]
+
+        entropy_mean = None
+        entropy_std = None
+        if group_entropies is not None:
+            entropy_mean = group_entropies.mean().item()
+            entropy_std = _std_value(group_entropies)
+
+        extracted_answers = [_extract_prediction_answer(response) for response in responses[start:end]]
+        majority_answer, support = _majority_equivalent_answer(extracted_answers)
+        pseudo_target_mismatch = False
+        if majority_answer is not None and support >= 2 and target_answers is not None:
+            pseudo_target_mismatch = not _answers_equivalent(majority_answer, target_answers[start])
+
+        prompt_text = _clean_text(prompts[start])
+        record: Dict[str, Any] = {
+            "step": int(step) if step is not None else None,
+            "prompt_hash": hashlib.md5(prompt_text.encode("utf-8")).hexdigest(),
+            "sample_count": end - start,
+            "target_pass_rate": target_correct[start:end].float().mean().item(),
+            "pseudo_target_mismatch": int(pseudo_target_mismatch),
+        }
+        if domains is not None:
+            record["domain"] = str(domains[start])
+        if is_noisy_values is not None:
+            record["is_noisy"] = bool(is_noisy_values[start])
+        if entropy_mean is not None:
+            record["entropy_mean"] = entropy_mean
+            record["entropy_std"] = entropy_std
+        records.append(record)
+
+    return records
 
 
 class MetricsManager:
@@ -614,6 +862,396 @@ class MetricsManager:
             metrics["noisy/group/gold_all_correct_groups_ratio"] = gold_all_correct
             metrics["noisy/group/gold_all_incorrect_groups_ratio"] = gold_all_incorrect
             metrics["noisy/group/gold_mixed_groups_ratio"] = 1.0 - gold_all_correct - gold_all_incorrect
+
+        self.add_metrics(metrics)
+        return metrics
+
+    def _sample_entropy_stats(
+        self,
+        batch,
+        entropy_tensor: Optional[torch.Tensor],
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        if entropy_tensor is None:
+            return None, None
+        response_mask = batch.batch["response_mask"][:, 1:].bool()
+        sample_entropy = masked_mean(entropy_tensor, response_mask, dim=-1).float()
+        valid_mask = response_mask.any(dim=-1)
+        return sample_entropy, valid_mask
+
+    def _sample_advantage_stats(self, batch) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        if "advantages" not in batch.batch:
+            return None, None
+        response_mask = batch.batch.get("final_response_mask", batch.batch["response_mask"][:, 1:]).bool()
+        sample_adv = masked_mean(batch.batch["advantages"], response_mask, dim=-1).float()
+        valid_mask = response_mask.any(dim=-1)
+        return sample_adv, valid_mask
+
+    def _sample_answer_entropy_stats(
+        self,
+        batch,
+        tokenizer,
+        n_sample: int,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        if tokenizer is None or len(batch) == 0:
+            return None, None, None
+
+        group_size = max(int(n_sample or 1), 1)
+        device = batch.batch["scores"].device
+        response_mask = batch.batch.get("final_response_mask", batch.batch["response_mask"][:, 1:]).bool()
+        sample_valid = response_mask.any(dim=-1)
+        responses = tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=False)
+        target_answers = batch.non_tensor_batch.get("ground_truth")
+
+        sample_answer_entropy = torch.zeros(len(batch), dtype=torch.float32, device=device)
+        valid_mask = torch.zeros(len(batch), dtype=torch.bool, device=device)
+        pseudo_target_mismatch_mask = torch.zeros(len(batch), dtype=torch.bool, device=device)
+
+        for start in range(0, len(batch), group_size):
+            end = min(start + group_size, len(batch))
+            if start >= end:
+                continue
+
+            group_valid_mask = sample_valid[start:end]
+            if not torch.any(group_valid_mask):
+                continue
+
+            group_answers: List[str] = []
+            group_answer_indices: List[int] = []
+            for local_idx, response in enumerate(responses[start:end]):
+                if not group_valid_mask[local_idx]:
+                    continue
+                answer = _extract_prediction_answer(response)
+                if not answer:
+                    continue
+                group_answers.append(answer)
+                group_answer_indices.append(local_idx)
+
+            clusters = _equivalent_answer_clusters(group_answers, answer_indices=group_answer_indices)
+            answer_entropy = _answer_entropy_from_clusters(clusters)
+            if answer_entropy is None:
+                continue
+
+            valid_indices = torch.nonzero(group_valid_mask, as_tuple=False).squeeze(-1)
+            sample_answer_entropy[start + valid_indices] = answer_entropy
+            valid_mask[start + valid_indices] = True
+
+            majority_answer, support = _majority_equivalent_answer(group_answers)
+            if (
+                majority_answer is None
+                or support < 2
+                or target_answers is None
+                or _answers_equivalent(majority_answer, target_answers[start])
+            ):
+                continue
+
+            for cluster in clusters:
+                if _answers_equivalent(cluster["representative"], majority_answer):
+                    mismatch_indices = torch.tensor(cluster["indices"], dtype=torch.long, device=device)
+                    pseudo_target_mismatch_mask[start + mismatch_indices] = True
+                    break
+
+        return sample_answer_entropy, valid_mask, pseudo_target_mismatch_mask
+
+    @staticmethod
+    def _mean_if_any(values: torch.Tensor, mask: torch.Tensor) -> Optional[float]:
+        mask = mask.bool()
+        if values.numel() == 0 or mask.numel() == 0 or not torch.any(mask):
+            return None
+        return values[mask].float().mean().item()
+
+    @staticmethod
+    def _masked_mean_value(values: Optional[torch.Tensor], mask: torch.Tensor) -> Optional[float]:
+        if values is None:
+            return None
+        mask = mask.bool()
+        if mask.numel() == 0 or not torch.any(mask):
+            return None
+        return values[mask].mean().item()
+
+    def _pseudo_target_mismatch_entropy(
+        self,
+        noisy_batch,
+        sample_entropy: Optional[torch.Tensor],
+        entropy_valid_mask: Optional[torch.Tensor],
+        n_sample: int,
+        tokenizer,
+    ) -> Optional[float]:
+        if (
+            tokenizer is None
+            or sample_entropy is None
+            or entropy_valid_mask is None
+            or n_sample <= 1
+            or len(noisy_batch) < n_sample
+            or len(noisy_batch) % n_sample != 0
+        ):
+            return None
+
+        responses = tokenizer.batch_decode(noisy_batch.batch["responses"], skip_special_tokens=False)
+        grouped_entropy = sample_entropy.reshape(-1, n_sample)
+        grouped_valid = entropy_valid_mask.reshape(-1, n_sample)
+        target_answers = noisy_batch.non_tensor_batch["ground_truth"]
+
+        pseudo_response_entropies: List[torch.Tensor] = []
+        num_groups = len(noisy_batch) // n_sample
+        for group_idx in range(num_groups):
+            start = group_idx * n_sample
+            end = start + n_sample
+            extracted_answers = [_extract_prediction_answer(response) for response in responses[start:end]]
+            majority_answer, support = _majority_equivalent_answer(extracted_answers)
+            if majority_answer is None or support < 2:
+                continue
+
+            target_answer = target_answers[start]
+            if _answers_equivalent(majority_answer, target_answer):
+                continue
+
+            valid_mask = grouped_valid[group_idx]
+            for sample_idx, answer in enumerate(extracted_answers):
+                if valid_mask[sample_idx] and _answers_equivalent(answer, majority_answer):
+                    pseudo_response_entropies.append(grouped_entropy[group_idx][sample_idx])
+
+        if not pseudo_response_entropies:
+            return None
+        return torch.stack(pseudo_response_entropies).mean().item()
+
+    def _gold_top_rates_on_gold_pass(
+        self,
+        noisy_batch,
+        gold_correct: torch.Tensor,
+        n_sample: int,
+        tokenizer,
+    ) -> Tuple[Optional[float], Optional[float]]:
+        if (
+            tokenizer is None
+            or n_sample <= 1
+            or len(noisy_batch) < n_sample
+            or len(noisy_batch) % n_sample != 0
+        ):
+            return None, None
+
+        responses = tokenizer.batch_decode(noisy_batch.batch["responses"], skip_special_tokens=False)
+        grouped_gold = gold_correct.reshape(-1, n_sample).bool()
+
+        strict_majority_values: List[float] = []
+        tied_top_values: List[float] = []
+
+        num_groups = len(noisy_batch) // n_sample
+        for group_idx in range(num_groups):
+            start = group_idx * n_sample
+            end = start + n_sample
+            gold_mask = grouped_gold[group_idx]
+            gold_count = int(gold_mask.sum().item())
+            if gold_count <= 0:
+                continue
+
+            other_answers: List[str] = []
+            for local_idx, response in enumerate(responses[start:end]):
+                if gold_mask[local_idx]:
+                    continue
+                answer = _extract_prediction_answer(response)
+                if answer:
+                    other_answers.append(answer)
+
+            other_clusters = _equivalent_answer_clusters(other_answers)
+            max_other_count = max((int(cluster["count"]) for cluster in other_clusters), default=0)
+
+            strict_majority_values.append(float(gold_count > max_other_count))
+            tied_top_values.append(float(gold_count == max_other_count and max_other_count > 0))
+
+        if not strict_majority_values:
+            return None, None
+
+        return float(np.mean(strict_majority_values)), float(np.mean(tied_top_values))
+
+    def add_selected_clean_noisy_metrics(
+        self,
+        batch,
+        entropy_tensor: Optional[torch.Tensor] = None,
+        tokenizer=None,
+        n_sample: int = -1,
+    ) -> Dict[str, Any]:
+        if "is_noisy" not in batch.non_tensor_batch:
+            return {}
+
+        device = batch.batch["scores"].device
+        clean_mask = torch.as_tensor(~_to_bool_numpy(batch.non_tensor_batch["is_noisy"]), dtype=torch.bool, device=device)
+        noisy_mask = ~clean_mask
+
+        target_correct = batch.batch["scores"].float() > 0.5
+        gold_correct = (
+            batch.batch["gold_scores"].float() > 0.5
+            if "gold_scores" in batch.batch
+            else target_correct.clone()
+        )
+
+        sample_entropy, entropy_valid_mask = self._sample_entropy_stats(batch, entropy_tensor)
+        sample_adv, adv_valid_mask = self._sample_advantage_stats(batch)
+        sample_answer_entropy, answer_entropy_valid_mask, pseudo_target_mismatch_answer_mask = (
+            self._sample_answer_entropy_stats(batch, tokenizer, n_sample)
+        )
+
+        metrics: Dict[str, Any] = {}
+
+        def add_if_present(name: str, value: Optional[float]) -> None:
+            if value is not None:
+                metrics[name] = value
+
+        def add_partition_metrics(prefix: str, partition_mask: torch.Tensor) -> None:
+            add_if_present(
+                f"{prefix}/entropy_mean",
+                self._masked_mean_value(sample_entropy, partition_mask & entropy_valid_mask)
+                if entropy_valid_mask is not None
+                else None,
+            )
+            add_if_present(
+                f"{prefix}/target_correct_entropy_mean",
+                self._masked_mean_value(sample_entropy, partition_mask & target_correct & entropy_valid_mask)
+                if entropy_valid_mask is not None
+                else None,
+            )
+            add_if_present(
+                f"{prefix}/target_wrong_entropy_mean",
+                self._masked_mean_value(sample_entropy, partition_mask & (~target_correct) & entropy_valid_mask)
+                if entropy_valid_mask is not None
+                else None,
+            )
+            add_if_present(
+                f"{prefix}/answer_entropy_mean",
+                self._masked_mean_value(sample_answer_entropy, partition_mask & answer_entropy_valid_mask)
+                if answer_entropy_valid_mask is not None
+                else None,
+            )
+            add_if_present(
+                f"{prefix}/target_correct_answer_entropy_mean",
+                self._masked_mean_value(sample_answer_entropy, partition_mask & target_correct & answer_entropy_valid_mask)
+                if answer_entropy_valid_mask is not None
+                else None,
+            )
+            add_if_present(
+                f"{prefix}/target_wrong_answer_entropy_mean",
+                self._masked_mean_value(sample_answer_entropy, partition_mask & (~target_correct) & answer_entropy_valid_mask)
+                if answer_entropy_valid_mask is not None
+                else None,
+            )
+
+            if torch.any(partition_mask):
+                metrics[f"{prefix}/target_correct_ratio"] = target_correct[partition_mask].float().mean().item()
+
+            add_if_present(
+                f"{prefix}/advantages_mean",
+                self._masked_mean_value(sample_adv, partition_mask & adv_valid_mask)
+                if adv_valid_mask is not None
+                else None,
+            )
+            add_if_present(
+                f"{prefix}/target_correct_advantages_mean",
+                self._masked_mean_value(sample_adv, partition_mask & target_correct & adv_valid_mask)
+                if adv_valid_mask is not None
+                else None,
+            )
+            add_if_present(
+                f"{prefix}/target_wrong_advantages_mean",
+                self._masked_mean_value(sample_adv, partition_mask & (~target_correct) & adv_valid_mask)
+                if adv_valid_mask is not None
+                else None,
+            )
+
+        add_partition_metrics("clean", clean_mask)
+        add_partition_metrics("noisy", noisy_mask)
+
+        if torch.any(noisy_mask):
+            metrics["noisy/gold_correct_ratio"] = gold_correct[noisy_mask].float().mean().item()
+            add_if_present(
+                "noisy/gold_correct_entropy_mean",
+                self._masked_mean_value(sample_entropy, noisy_mask & gold_correct & entropy_valid_mask)
+                if entropy_valid_mask is not None
+                else None,
+            )
+            add_if_present(
+                "noisy/gold_correct_answer_entropy_mean",
+                self._masked_mean_value(sample_answer_entropy, noisy_mask & gold_correct & answer_entropy_valid_mask)
+                if answer_entropy_valid_mask is not None
+                else None,
+            )
+            add_if_present(
+                "noisy/target_gold_both_wrong_entropy_mean",
+                self._masked_mean_value(sample_entropy, noisy_mask & (~target_correct) & (~gold_correct) & entropy_valid_mask)
+                if entropy_valid_mask is not None
+                else None,
+            )
+            add_if_present(
+                "noisy/target_gold_both_wrong_answer_entropy_mean",
+                self._masked_mean_value(
+                    sample_answer_entropy,
+                    noisy_mask & (~target_correct) & (~gold_correct) & answer_entropy_valid_mask,
+                )
+                if answer_entropy_valid_mask is not None
+                else None,
+            )
+
+            noisy_batch = batch.select_idxs(noisy_mask.detach().cpu().numpy())
+            noisy_entropy = None
+            noisy_entropy_valid = None
+            if sample_entropy is not None and entropy_valid_mask is not None:
+                noisy_entropy = sample_entropy[noisy_mask]
+                noisy_entropy_valid = entropy_valid_mask[noisy_mask]
+            add_if_present(
+                "noisy/pseudo_target_mismatch_entropy_mean",
+                self._pseudo_target_mismatch_entropy(
+                    noisy_batch=noisy_batch,
+                    sample_entropy=noisy_entropy,
+                    entropy_valid_mask=noisy_entropy_valid,
+                    n_sample=n_sample,
+                    tokenizer=tokenizer,
+                ),
+            )
+            add_if_present(
+                "noisy/pseudo_target_mismatch_answer_entropy_mean",
+                self._masked_mean_value(
+                    sample_answer_entropy,
+                    noisy_mask & pseudo_target_mismatch_answer_mask & answer_entropy_valid_mask,
+                )
+                if answer_entropy_valid_mask is not None and pseudo_target_mismatch_answer_mask is not None
+                else None,
+            )
+
+            group_size = max(int(n_sample or 1), 1)
+            noisy_gold = gold_correct[noisy_mask]
+            noisy_target = target_correct[noisy_mask]
+            if noisy_gold.numel() > 0 and noisy_gold.numel() % group_size == 0:
+                grouped_gold = noisy_gold.reshape(-1, group_size)
+                grouped_target = noisy_target.reshape(-1, group_size)
+                gold_count = grouped_gold.sum(dim=1)
+                target_count = grouped_target.sum(dim=1)
+                gold_pass = gold_count > 0
+                target_pass_given_gold = target_count > 0
+
+                metrics["noisy/gold_pass_rate"] = gold_pass.float().mean().item()
+                add_if_present(
+                    "noisy/gold_count_mean_on_gold_pass",
+                    self._mean_if_any(gold_count, gold_pass),
+                )
+                add_if_present(
+                    "noisy/gold_pass_target_pass_rate",
+                    self._mean_if_any(target_pass_given_gold.float(), gold_pass),
+                )
+                add_if_present(
+                    "noisy/target_count_mean_on_gold_pass",
+                    self._mean_if_any(target_count, gold_pass),
+                )
+                add_if_present(
+                    "noisy/gold_pass_target_zero_rate",
+                    self._mean_if_any((target_count == 0).float(), gold_pass),
+                )
+
+                gold_strict_majority_rate, gold_tied_top_rate = self._gold_top_rates_on_gold_pass(
+                    noisy_batch=noisy_batch,
+                    gold_correct=noisy_gold,
+                    n_sample=group_size,
+                    tokenizer=tokenizer,
+                )
+                add_if_present("noisy/gold_strict_majority_rate", gold_strict_majority_rate)
+                add_if_present("noisy/gold_tied_top_rate", gold_tied_top_rate)
 
         self.add_metrics(metrics)
         return metrics

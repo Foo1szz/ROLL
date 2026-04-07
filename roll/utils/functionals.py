@@ -389,12 +389,51 @@ def reduce_metrics(metrics: dict, reduce_func=np.mean) -> dict:
             return np.sum
         else:
             return reduce_func
+
+    def _flatten_metric_values(values):
+        """Flatten nested metric containers into a 1-D list of numeric scalars."""
+        flattened = []
+
+        def _visit(value):
+            if value is None:
+                return
+
+            if isinstance(value, torch.Tensor):
+                if value.numel() == 0:
+                    return
+                flattened.extend(value.detach().cpu().reshape(-1).tolist())
+                return
+
+            if isinstance(value, np.ndarray):
+                if value.size == 0:
+                    return
+                if value.dtype == object:
+                    for item in value.tolist():
+                        _visit(item)
+                else:
+                    flattened.extend(value.reshape(-1).tolist())
+                return
+
+            if isinstance(value, (list, tuple)):
+                for item in value:
+                    _visit(item)
+                return
+
+            if np.isscalar(value):
+                flattened.append(value.item() if isinstance(value, np.generic) else value)
+                return
+
+            flattened.append(value)
+
+        _visit(values)
+        return flattened
     
     for key, val in metrics.items():
         if isinstance(val, (list, tuple, np.ndarray)) and len(val) > 0:
             # Use suffix-based aggregation if available
             aggregation_func = _parse_suffix(key)
-            metrics[key] = float(aggregation_func(val))
+            flat_val = _flatten_metric_values(val)
+            metrics[key] = float(aggregation_func(flat_val)) if len(flat_val) > 0 else float("nan")
         else:
             # Fallback to default reduction function
             metrics[key] = reduce_func(val)
