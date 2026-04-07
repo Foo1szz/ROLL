@@ -14,7 +14,6 @@ from math_verify import parse, verify
 from codetiming import Timer
 from tqdm import tqdm
 import signal
-import multiprocessing
 
 from roll.configs.worker_config import WorkerConfig
 from roll.distributed.executor.worker import Worker
@@ -157,7 +156,7 @@ def _extract_predicted_answer(cleaned_response: str, reward_type: Optional[str],
     return parsed_answers[0], str(parsed_answers[0])
 
 
-def _hf_verify_math_sample_multi(response, answers, result, prompt, reward_type=None):
+def _hf_verify_math_sample_multi(response, answers, prompt, reward_type=None):
     try:
         # 在解析之前，先对模型的原始输出进行预处理
         cleaned_response = _extract_after_last_end_think(response, prompt)
@@ -202,38 +201,20 @@ def _hf_verify_math_sample_multi(response, answers, result, prompt, reward_type=
             else:
                 ans = verify(parsed_target[0], exect_answer)
                 verify_results.append((ans, str(parsed_target[0]), str(extracted_response)))
-        result.append(verify_results)
+        return verify_results
             
     except Exception as e:
         # 捕获任何潜在的异常，确保进程不会崩溃
-        result.append([(False, "", "") for _ in answers])
+        return [(False, "", "") for _ in answers]
 
 
 def hf_verify_math_sample_multi(response, answers, prompt, timeout_sec=5.0, reward_type=None):
-    with multiprocessing.Manager() as manager:
-        result = manager.list()
-        
-        p = multiprocessing.Process(
-            target=_hf_verify_math_sample_multi,
-            args=(response, answers, result, prompt, reward_type)
-        )
-        
-        p.start()
-        try:
-            max_timeout = min(timeout_sec + 1, 10)
-            p.join(timeout=max_timeout)
-        except Exception as e:
-            pass
-        finally:
-            if p.is_alive():
-                p.terminate()
-                p.join(timeout=2)
-                if p.is_alive():
-                    p.kill()
-            p.join(timeout=2)
-        if not result:
-            return [(False, "", "") for _ in answers]
-        return result[0]
+    return _hf_verify_math_sample_multi(
+        response=response,
+        answers=answers,
+        prompt=prompt,
+        reward_type=reward_type,
+    )
 
 
 def hf_verify_math_sample(response, answer, prompt, timeout_sec=5.0, reward_type=None):

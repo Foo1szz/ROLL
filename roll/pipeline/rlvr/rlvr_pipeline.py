@@ -381,7 +381,14 @@ class RLVRPipeline(BasePipeline):
 
     @staticmethod
     def _filter_logged_metrics(metrics: Dict[str, Any]) -> Dict[str, Any]:
-        return {key: value for key, value in metrics.items() if key in SELECTED_LOG_METRICS}
+        filtered_metrics = {}
+        for key, value in metrics.items():
+            if key.startswith("clean/") or key.startswith("noisy/"):
+                if key in SELECTED_LOG_METRICS:
+                    filtered_metrics[key] = value
+            else:
+                filtered_metrics[key] = value
+        return filtered_metrics
 
     @torch.no_grad()
     def save_metrics(self, batch):
@@ -756,6 +763,13 @@ class RLVRPipeline(BasePipeline):
                 batch.reorder(indices=torch.argsort(batch.batch["prompt_id"]))
 
                 n_sample = batch.meta_info.get("generation_config", {}).get("num_return_sequences", 1)
+                metrics_mgr.add_all_metrics(
+                    global_step,
+                    batch,
+                    resource_manager=self.resource_manager,
+                    actor_infer=self.actor_infer,
+                    actor_train=self.actor_train,
+                )
                 self.save_prompt_metrics(batch, entropy_tensor=old_log_probs_entropy, n_sample=n_sample)
                 batch.pop("prompt_id")
                 metrics_mgr.add_selected_clean_noisy_metrics(
