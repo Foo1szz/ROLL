@@ -1225,7 +1225,12 @@ class MetricsManager:
                 target_count = grouped_target.sum(dim=1)
                 gold_pass = gold_count > 0
                 target_pass_given_gold = target_count > 0
+                target_zero = target_count == 0
 
+                metrics["noisy/effective_update_count"] = float(target_pass_given_gold.sum().item())
+                metrics["noisy/effective_update_rate"] = target_pass_given_gold.float().mean().item()
+                metrics["noisy/zero_update_count"] = float(target_zero.sum().item())
+                metrics["noisy/zero_update_rate"] = target_zero.float().mean().item()
                 metrics["noisy/gold_pass_rate"] = gold_pass.float().mean().item()
                 add_if_present(
                     "noisy/gold_count_mean_on_gold_pass",
