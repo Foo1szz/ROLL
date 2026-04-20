@@ -1216,6 +1216,18 @@ class MetricsManager:
             )
 
             group_size = max(int(n_sample or 1), 1)
+            clean_target = target_correct[clean_mask]
+            if clean_target.numel() > 0 and clean_target.numel() % group_size == 0:
+                grouped_clean_target = clean_target.reshape(-1, group_size)
+                clean_target_count = grouped_clean_target.sum(dim=1)
+                clean_target_pass = clean_target_count > 0
+                clean_target_zero = clean_target_count == 0
+
+                metrics["clean/effective_update_count"] = float(clean_target_pass.sum().item())
+                metrics["clean/effective_update_rate"] = clean_target_pass.float().mean().item()
+                metrics["clean/zero_update_count"] = float(clean_target_zero.sum().item())
+                metrics["clean/zero_update_rate"] = clean_target_zero.float().mean().item()
+
             noisy_gold = gold_correct[noisy_mask]
             noisy_target = target_correct[noisy_mask]
             if noisy_gold.numel() > 0 and noisy_gold.numel() % group_size == 0:

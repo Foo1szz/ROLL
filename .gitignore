@@ -173,4 +173,4 @@ log
 # examples
 
 output/
-.vscode/
+.vscode/*.whl

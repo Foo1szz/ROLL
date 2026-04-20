@@ -63,6 +63,12 @@ def default_tokenizer_provider(model_args: "ModelArguments", model_name_or_path:
         trust_remote_code=True,
         padding_side="left",
     )
+    if tokenizer.pad_token is None:
+        if tokenizer.eos_token is None:
+            raise ValueError(
+                f"Tokenizer for model {model_name_or_path!r} does not have a pad_token or eos_token."
+            )
+        tokenizer.pad_token = tokenizer.eos_token
     return tokenizer
 
 

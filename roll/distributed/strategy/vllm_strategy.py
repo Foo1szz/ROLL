@@ -108,6 +108,13 @@ class VllmStrategy(InferenceStrategy):
             )
             loop = asyncio.get_event_loop()
             self.tokenizer = loop.run_until_complete(self.model.get_tokenizer())
+        if self.tokenizer.pad_token is None:
+            if self.tokenizer.eos_token is None:
+                raise ValueError(
+                    f"Tokenizer for model {self.worker_config.model_args.model_name_or_path!r} "
+                    "does not have a pad_token or eos_token."
+                )
+            self.tokenizer.pad_token = self.tokenizer.eos_token
         additional_special_tokens = self.tokenizer.additional_special_tokens
         special_tokens = [
             add_token
